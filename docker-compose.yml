@@ -1,0 +1,15 @@
+services:
+  radio-archive:
+    build: .
+    image: radio-archive:1.0.0
+    container_name: radio-archive
+    ports:
+      - "8000:8000"
+    volumes:
+      - radio-data:/data
+    environment:
+      RADIO_DB_PATH: /data/radio.db
+    restart: unless-stopped
+
+volumes:
+  radio-data:
