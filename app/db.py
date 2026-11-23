@@ -17,6 +17,7 @@ import json
 import sqlite3
 import threading
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,8 @@ from .domain import (
     ArrangementModel,
     Blackout,
     Program,
+    coerce_epoch_seconds,
+    epoch_to_json_value,
     is_solvable,
     load_zone,
     local_naive_to_utc_candidates,
@@ -40,22 +43,68 @@ CREATE TABLE IF NOT EXISTS channels (
 CREATE TABLE IF NOT EXISTS programs (
     channel_id   TEXT NOT NULL,
     seq          INTEGER NOT NULL,
-    local_start  TEXT NOT NULL,           -- 原始本地墙钟时刻，ISO 格式、无时区
+    local_start  TEXT NOT NULL,           -- 原始本地墙钟时刻，ISO 格式、无时区（可带小数秒）
     duration     INTEGER NOT NULL,
-    utc_options  TEXT NOT NULL,           -- JSON: 合法 UTC 开播候选（纪元秒）
+    utc_options  TEXT NOT NULL,           -- JSON: 合法 UTC 开播候选（整数或十进制字符串）
     PRIMARY KEY (channel_id, seq),
     FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
 );
 CREATE TABLE IF NOT EXISTS blackouts (
     channel_id   TEXT NOT NULL,
     blackout_id  TEXT NOT NULL,
-    start_utc    INTEGER NOT NULL,
-    end_utc      INTEGER NOT NULL,
+    start_utc    TEXT NOT NULL,           -- 十进制纪元秒文本（整秒或带小数秒）
+    end_utc      TEXT NOT NULL,
     note         TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (channel_id, blackout_id),
     FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
 );
 """
+
+
+def _epoch_text(epoch) -> str:
+    """纪元秒 -> 十进制文本；SQLite 原样保存，读出后再精确还原。"""
+    return format(epoch, "f")
+
+
+def _migrate_blackout_precision(conn: sqlite3.Connection) -> None:
+    """把旧库的 ``blackouts.start_utc/end_utc``（INTEGER 秒）迁到 TEXT。
+
+    旧库里的整数秒与新写入的小数秒必须共用同一列；TEXT 亲和性可原样保存
+    ``1730611800.25``，避免 REAL 亲和性把微秒舍入掉。迁移是幂等的：列类型
+    已是 TEXT 时直接返回；整个重建在一个事务内完成。
+    """
+    info = conn.execute("PRAGMA table_info(blackouts)").fetchall()
+    if not info:  # pragma: no cover - 建表后必然存在
+        return
+    types = {row["name"]: (row["type"] or "").upper() for row in info}
+    if types.get("start_utc") == "TEXT" and types.get("end_utc") == "TEXT":
+        return
+    conn.execute("BEGIN IMMEDIATE;")
+    try:
+        conn.execute("ALTER TABLE blackouts RENAME TO blackouts_legacy;")
+        conn.execute(
+            """
+            CREATE TABLE blackouts (
+                channel_id   TEXT NOT NULL,
+                blackout_id  TEXT NOT NULL,
+                start_utc    TEXT NOT NULL,
+                end_utc      TEXT NOT NULL,
+                note         TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (channel_id, blackout_id),
+                FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO blackouts(channel_id, blackout_id, start_utc, end_utc, note) "
+            "SELECT channel_id, blackout_id, CAST(start_utc AS TEXT), "
+            "CAST(end_utc AS TEXT), note FROM blackouts_legacy;"
+        )
+        conn.execute("DROP TABLE blackouts_legacy;")
+        conn.execute("COMMIT;")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
 
 
 class Repository:
@@ -66,6 +115,7 @@ class Repository:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
             conn.execute("PRAGMA journal_mode=WAL;")
+            _migrate_blackout_precision(conn)
             conn.commit()
 
     # ------------------------------------------------------------------ #
@@ -101,7 +151,13 @@ class Repository:
             programs.append(Program(seq=row["seq"], duration=row["duration"], starts=starts))
         bl = tuple(
             sorted(
-                (Blackout(start=b["start_utc"], end=b["end_utc"]) for b in blackouts),
+                (
+                    Blackout(
+                        start=coerce_epoch_seconds(b["start_utc"]),
+                        end=coerce_epoch_seconds(b["end_utc"]),
+                    )
+                    for b in blackouts
+                ),
                 key=lambda b: b.start,
             )
         )
@@ -121,15 +177,27 @@ class Repository:
             Program(
                 seq=r["seq"],
                 duration=r["duration"],
-                starts=tuple(json.loads(r["utc_options"])),
+                # 旧库写的是整数纪元秒，新库可能混有十进制字符串；统一精确还原。
+                starts=tuple(coerce_epoch_seconds(v) for v in json.loads(r["utc_options"])),
             )
             for r in prog_rows
         )
         bl_rows = conn.execute(
-            "SELECT start_utc, end_utc FROM blackouts WHERE channel_id=? ORDER BY start_utc",
+            "SELECT start_utc, end_utc FROM blackouts WHERE channel_id=?",
             (channel_id,),
         ).fetchall()
-        blackouts = tuple(Blackout(r["start_utc"], r["end_utc"]) for r in bl_rows)
+        blackouts = tuple(
+            sorted(
+                (
+                    Blackout(
+                        coerce_epoch_seconds(r["start_utc"]),
+                        coerce_epoch_seconds(r["end_utc"]),
+                    )
+                    for r in bl_rows
+                ),
+                key=lambda b: b.start,
+            )
+        )
         return ArrangementModel(timezone=ch["timezone"], programs=programs, blackouts=blackouts)
 
     # ------------------------------------------------------------------ #
@@ -153,7 +221,7 @@ class Repository:
             ).fetchall()
             blackouts = conn.execute(
                 "SELECT blackout_id, start_utc, end_utc, note "
-                "FROM blackouts WHERE channel_id=? ORDER BY start_utc",
+                "FROM blackouts WHERE channel_id=?",
                 (channel_id,),
             ).fetchall()
             result = {
@@ -167,11 +235,23 @@ class Repository:
                         "seq": r["seq"],
                         "local_start": r["local_start"],
                         "duration": r["duration"],
-                        "utc_options": json.loads(r["utc_options"]),
+                        "utc_options": [coerce_epoch_seconds(v) for v in json.loads(r["utc_options"])],
                     }
                     for r in programs
                 ],
-                "blackouts": [dict(r) for r in blackouts],
+                # TEXT 列按十进制数值而非字典序排序（"1000" < "999" 是字典序陷阱）。
+                "blackouts": sorted(
+                    (
+                        {
+                            "blackout_id": r["blackout_id"],
+                            "start_utc": coerce_epoch_seconds(r["start_utc"]),
+                            "end_utc": coerce_epoch_seconds(r["end_utc"]),
+                            "note": r["note"],
+                        }
+                        for r in blackouts
+                    ),
+                    key=lambda b: (b["start_utc"], b["end_utc"], b["blackout_id"]),
+                ),
             }
             conn.execute("COMMIT;")
             return result
@@ -234,8 +314,14 @@ class Repository:
                     "INSERT INTO programs(channel_id, seq, local_start, duration, utc_options) "
                     "VALUES(?, ?, ?, ?, ?)",
                     [
-                        (channel_id, p.seq, p_local_start(rows, p.seq), p.duration,
-                         json.dumps(list(p.starts)))
+                        (
+                            channel_id,
+                            p.seq,
+                            p_local_start(rows, p.seq),
+                            p.duration,
+                            # 整数候选写 int，带小数秒的候选写精确十进制字符串。
+                            json.dumps([epoch_to_json_value(s) for s in p.starts]),
+                        )
                         for p in model.programs
                     ],
                 )
@@ -257,9 +343,18 @@ class Repository:
         return version
 
     def upsert_blackout(
-        self, channel_id: str, blackout_id: str, start_utc: int, end_utc: int, note: str
+        self,
+        channel_id: str,
+        blackout_id: str,
+        start_utc: Decimal,
+        end_utc: Decimal,
+        note: str,
     ) -> int:
         """登记/更正一条 UTC 停播段；若新资料使整档无解则回滚，返回版本号。"""
+        start_utc = coerce_epoch_seconds(start_utc)
+        end_utc = coerce_epoch_seconds(end_utc)
+        if end_utc <= start_utc:
+            raise ValueError("停播段为半开区间 [start_utc, end_utc)，必须 end_utc > start_utc")
         with self._write_lock, self._connect() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE;")
@@ -273,7 +368,13 @@ class Repository:
                     "VALUES(?, ?, ?, ?, ?) "
                     "ON CONFLICT(channel_id, blackout_id) DO UPDATE SET "
                     "start_utc=excluded.start_utc, end_utc=excluded.end_utc, note=excluded.note",
-                    (channel_id, blackout_id, start_utc, end_utc, note),
+                    (
+                        channel_id,
+                        blackout_id,
+                        _epoch_text(start_utc),
+                        _epoch_text(end_utc),
+                        note,
+                    ),
                 )
                 model = self._read_model(conn, channel_id)
                 if not is_solvable(model):

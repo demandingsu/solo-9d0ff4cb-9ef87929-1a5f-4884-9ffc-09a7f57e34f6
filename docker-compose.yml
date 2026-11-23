@@ -1,7 +1,7 @@
 services:
   radio-archive:
     build: .
-    image: radio-archive:1.0.0
+    image: radio-archive:1.1.0
     container_name: radio-archive
     ports:
       - "8000:8000"
@@ -10,6 +10,16 @@ services:
     environment:
       RADIO_DB_PATH: /data/radio.db
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/').status==200 else 1)"
+      interval: 15s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
 
 volumes:
   radio-data:

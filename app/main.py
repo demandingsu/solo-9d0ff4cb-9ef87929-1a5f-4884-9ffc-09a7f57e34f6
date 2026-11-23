@@ -8,6 +8,7 @@
 * ``PUT  /channels/{id}/blackouts`` 登记/更正一条 UTC 停播段
 * ``DELETE /channels/{id}/blackouts/{bid}`` 删除停播段
 * ``GET  /channels/{id}/query?utc_second=`` 查档：某 UTC 秒的播出节目与空档判定
+  （整秒或带至多 6 位小数；整秒查询覆盖该整秒 [t, t+1)）
 
 每次查询在单快照事务内读取同一份已提交资料；写入在单事务内校验并提交，
 整档无解或写入失败一律回滚，旧档继续可查。
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query
 
@@ -26,6 +28,7 @@ from .schemas import (
     BlackoutIn,
     ChannelOut,
     CommitOut,
+    EpochSeconds,
     LogUpload,
     QueryOut,
 )
@@ -41,11 +44,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="电台档案 UTC 查档服务",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "按 UTC 秒查询单频道电台节目。日志只记本地开播时刻，服务依据 IANA 时区"
-        "换算 UTC；夏令时回拨导致本地时刻出现两次时，两种 UTC 时刻均纳入核对。"
-        "时段均为半开区间 [start, end)。"
+        "按 UTC 秒查询单频道电台节目。日志只记本地开播时刻（可带小数秒），服务依据 "
+        "IANA 时区精确换算 UTC；夏令时回拨导致本地时刻出现两次时，两种 UTC 时刻均纳入核对。"
+        "时段均为半开区间 [start, end)。UTC 纪元秒可带至多 6 位小数（微秒），"
+        "整数秒与带小数秒的记录可在同一份档案中混用。"
     ),
     lifespan=lifespan,
 )
@@ -127,6 +131,8 @@ def upsert_blackout(channel_id: str, payload: BlackoutIn) -> CommitOut:
         raise HTTPException(status_code=404, detail=f"频道 {channel_id} 不存在") from exc
     except UnsolvableError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     model = _require_channel(channel_id)
     return CommitOut(
         channel_id=channel_id,
@@ -182,7 +188,16 @@ def solve(channel_id: str) -> dict:
 @app.get("/channels/{channel_id}/query", response_model=QueryOut, tags=["查档"])
 def query(
     channel_id: str,
-    utc_second: int = Query(..., description="要查的 UTC 纪元秒"),
+    utc_second: Annotated[
+        EpochSeconds,
+        Query(
+            description=(
+                "要查的 UTC 纪元秒；可带至多 6 位小数。整秒查询（如 1730611800）"
+                "会命中覆盖该整秒的节目，带小数秒时可精确到微秒。"
+            ),
+            examples=[1730611800, "1730611800.25"],
+        ),
+    ],
 ) -> QueryOut:
     """列出在至少一种完整排法中播到该秒的节目流水号，并判定该秒是否可能是空档。"""
     model, version = _require_snapshot(channel_id)
